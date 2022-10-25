@@ -461,7 +461,7 @@ class VisionTransformer(nn.Module):
 
         self.init_weights(weight_init)
 
-        self.freeze_stages()
+        # self.freeze_stages()
 
 
     def freeze_stages(self):

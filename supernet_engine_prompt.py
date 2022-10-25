@@ -10,6 +10,15 @@ from lib import utils
 import random
 import time
 
+from sklearn.metrics import confusion_matrix
+import seaborn as sn
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torchattacks
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+
 def sample_configs(choices, is_visual_prompt_tuning=False,is_adapter=False,is_LoRA=False,is_prefix=False):
 
     config = {}
@@ -53,12 +62,24 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
                     amp: bool = True, teacher_model: torch.nn.Module = None,
-                    teach_loss: torch.nn.Module = None, choices=None, mode='super', retrain_config=None,is_visual_prompt_tuning=False,is_adapter=False,is_LoRA=False,is_prefix=False):
+                    teach_loss: torch.nn.Module = None, choices=None, mode='super', retrain_config=None,is_visual_prompt_tuning=False,is_adapter=False,is_LoRA=False,is_prefix=False, classes=100):
     model.train()
     criterion.train()
 
     # set random seed
     random.seed(epoch)
+    
+    y_out = []
+    y_pred = []
+    y_true = []
+    
+    atk = torchattacks.PGD(model, eps=0.01/255,  alpha=0.02/255, steps=1)
+
+    # atk = torchattacks.APGDT(model, eps=0.1/255, steps=1, n_classes=classes)
+    # atk = torchattacks.Jitter(model, eps=0.1/255, alpha=0.2/255, steps=1)
+    # atk.set_mode_targeted_least_likely(1)
+
+    atk.set_normalization_used(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -99,7 +120,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     outputs = model(samples)
                     loss = criterion(outputs, targets)
         else:
-            outputs = model(samples)
+            # outputs = model(samples)
+
+            # If, images are normalized:
+            max_targets = targets.max(1)[1]
+            adv_images = atk(samples, max_targets)
+            outputs = model(adv_images)
+            # outputs = model(samples)
+
             if teacher_model:
                 with torch.no_grad():
                     teach_output = teacher_model(samples)
@@ -109,6 +137,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 loss = criterion(outputs, targets)
 
         loss_value = loss.item()
+        
+        y_out.extend(outputs.detach().cpu().numpy())
+        outputs = (torch.max(torch.exp(outputs), 1)[1]).data.cpu().numpy()
+        y_pred.extend(outputs) # Save Prediction
+        labels = targets.data.cpu().numpy()
+        y_true.extend(labels) # Save Truth
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -135,7 +169,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, y_pred, y_true, y_out
 
 @torch.no_grad()
 def evaluate(data_loader, model, device, amp=True, choices=None, mode='super', retrain_config=None,is_visual_prompt_tuning=False,is_adapter=False,is_LoRA=False,is_prefix=False):
@@ -158,6 +192,10 @@ def evaluate(data_loader, model, device, amp=True, choices=None, mode='super', r
     print("sampled model config: {}".format(config))
     parameters = model_module.get_sampled_params_numel(config)
     print("sampled model parameters: {}".format(parameters))
+    
+    y_out = []
+    y_pred = []
+    y_true = []
 
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
@@ -177,9 +215,24 @@ def evaluate(data_loader, model, device, amp=True, choices=None, mode='super', r
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        
+        y_out.extend(output.cpu().numpy())
+        output = (torch.max(torch.exp(output), 1)[1]).data.cpu().numpy()
+        y_pred.extend(output) # Save Prediction
+        labels = target.data.cpu().numpy()
+        y_true.extend(labels) # Save Truth
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    # classes = np.arange(0, 37)
+    # cf_matrix = confusion_matrix(y_true, y_pred)
+    # df_cm = pd.DataFrame(cf_matrix/np.sum(cf_matrix) *10, index = [i for i in classes],
+    #                     columns = [i for i in classes])
+    # plt.figure(figsize = (36,12))
+    # sn.heatmap(df_cm, annot=True)
+    # plt.savefig('./saves/output.png')
+    # plt.close()
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, y_pred, y_true, y_out

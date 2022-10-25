@@ -125,7 +125,7 @@ def get_args_parser():
 
     parser.add_argument('--repeated-aug', action='store_true')
     # parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
-
+    parser.add_argument('--save_output', action='store_true')
 
     # parser.set_defaults(repeated_aug=True)
 
@@ -386,7 +386,8 @@ def main(args):
 
     retrain_config = None
     if args.mode == 'retrain' and "RETRAIN" in cfg:
-        retrain_config = {'visual_prompt_dim':cfg.RETRAIN.VISUAL_PROMPT_DIM,'lora_dim':cfg.RETRAIN.LORA_DIM,'adapter_dim':cfg.RETRAIN.ADAPTER_DIM,'prefix_dim':cfg.RETRAIN.PREFIX_DIM,}
+        prefix_dim = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        retrain_config = {'visual_prompt_dim':cfg.RETRAIN.VISUAL_PROMPT_DIM,'lora_dim':cfg.RETRAIN.LORA_DIM,'adapter_dim':cfg.RETRAIN.ADAPTER_DIM,'prefix_dim':prefix_dim}
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device,  mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix)
@@ -401,15 +402,30 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(
+        train_stats, train_pred, train_true, train_out = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
             amp=args.amp, teacher_model=teacher_model,
             teach_loss=teacher_loss,
             choices=choices, mode = args.mode, retrain_config=retrain_config,
-            is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+            is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, classes=args.nb_classes,
         )
+
+        save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
+        if args.save_output:
+            if args.is_visual_prompt_tuning:
+                np.save('./VPT_adv/train_' + save_name + '_y_pred.npy', train_pred)
+                np.save('./VPT_adv/train_' + save_name + '_y_true.npy', train_true)
+                np.save('./VPT_adv/train_' + save_name + '_y_out.npy', train_out)
+            elif args.is_adapter:
+                np.save('./Adap_adv/train_' + save_name + '_y_pred.npy', train_pred)
+                np.save('./Adap_adv/train_' + save_name + '_y_true.npy', train_true)
+                np.save('./Adap_adv/train_' + save_name + '_y_out.npy', train_out)
+            elif args.is_LoRA:
+                np.save('./LoRA_adv/train_' + save_name + '_y_pred.npy', train_pred)
+                np.save('./LoRA_adv/train_' + save_name + '_y_true.npy', train_true)
+                np.save('./LoRA_adv/train_' + save_name + '_y_out.npy', train_out)
 
         lr_scheduler.step(epoch)
         if args.output_dir:
@@ -421,15 +437,31 @@ def main(args):
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'scaler': loss_scaler.state_dict(),
-                    'args': args,
+                    'args': args, 
                 }, checkpoint_path)
 
-        if epoch % args.val_interval == 0 or epoch == args.epochs-1:
-            test_stats = evaluate(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix)
+        if epoch > 40 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
+            test_stats, y_pred, y_true, y_out = evaluate(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix)
             print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            if max_accuracy < test_stats["acc1"]:
+                save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
+                if args.save_output:
+                    if args.is_visual_prompt_tuning:
+                        np.save('./VPT_adv/' + save_name + '_y_pred.npy', train_pred)
+                        np.save('./VPT_adv/' + save_name + '_y_true.npy', train_true)
+                        np.save('./VPT_adv/' + save_name + '_y_out.npy', train_out)
+                    elif args.is_adapter:
+                        np.save('./Adap_adv/' + save_name + '_y_pred.npy', train_pred)
+                        np.save('./Adap_adv/' + save_name + '_y_true.npy', train_true)
+                        np.save('./Adap_adv/' + save_name + '_y_out.npy', train_out)
+                    elif args.is_LoRA:
+                        np.save('./LoRA_adv/' + save_name + '_y_pred.npy', train_pred)
+                        np.save('./LoRA_adv/' + save_name + '_y_true.npy', train_true)
+                        np.save('./LoRA_adv/' + save_name + '_y_out.npy', train_out)
+
             max_accuracy = max(max_accuracy, test_stats["acc1"])
             print(f'Max accuracy: {max_accuracy:.2f}%')
-
+            
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         **{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
